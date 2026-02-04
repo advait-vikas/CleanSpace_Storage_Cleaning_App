@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Applications
   getInstalledApplications: () => ipcRenderer.invoke('get-installed-applications'),
+  getAppSizes: (apps) => ipcRenderer.invoke('get-app-sizes', apps),
+  uninstallApplication: (app) => ipcRenderer.invoke('uninstall-application', app),
 
   // Recommendations
   generateRecommendations: (files, applications) => ipcRenderer.invoke('generate-recommendations', files, applications),

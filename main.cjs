@@ -77,7 +77,6 @@ ipcMain.handle('hash-file', async (event, filePath) => {
 });
 
 // IPC: Scan directory with progress updates
-// IPC: Scan directory with progress updates
 ipcMain.handle('scan-directory-with-progress', async (event, dir, options = {}) => {
   const scannerId = Date.now().toString();
 
@@ -134,12 +133,63 @@ ipcMain.handle('cancel-scan', async (event, scannerId) => {
 // IPC: Get installed applications
 ipcMain.handle('get-installed-applications', async () => {
   try {
+    console.log('Fetching installed applications...');
     const apps = await appScanner.getInstalledApplications();
+    console.log(`Found ${apps.length} applications.`);
     return apps;
   } catch (error) {
     console.error('Error getting applications:', error);
     return [];
   }
+});
+
+// IPC: Calculate sizes for specific app folders
+ipcMain.handle('get-app-sizes', async (event, apps) => {
+  const results = [];
+  for (const app of apps) {
+    if (app.path && !app.size) {
+      try {
+        const size = appScanner.getDirectorySize(app.path);
+        results.push({ id: app.id, size });
+      } catch (e) {
+        results.push({ id: app.id, size: 0 });
+      }
+    }
+  }
+  return results;
+});
+
+// IPC: Uninstall application
+ipcMain.handle('uninstall-application', async (event, app) => {
+  if (!app.uninstallString) {
+    return { success: false, error: 'No uninstall string available' };
+  }
+
+  const mainWindow = BrowserWindow.getAllWindows()[0];
+  const response = await dialog.showMessageBox(mainWindow, {
+    type: 'question',
+    buttons: ['Cancel', 'Uninstall'],
+    defaultId: 1,
+    title: 'Confirm Uninstallation',
+    message: `Are you sure you want to uninstall ${app.name}?`,
+    detail: 'This will launch the application\'s uninstaller.'
+  });
+
+  if (response.response === 1) {
+    return new Promise((resolve) => {
+      const { exec } = require('child_process');
+      exec(app.uninstallString, (error) => {
+        if (error) {
+          console.error('Uninstall error:', error);
+          resolve({ success: false, error: error.message });
+        } else {
+          resolve({ success: true });
+        }
+      });
+    });
+  }
+
+  return { success: false, cancelled: true };
 });
 
 // IPC: Analyze files and categorize them
@@ -252,17 +302,13 @@ async function getDrives() {
             if (!err && stdout) {
               const lines = stdout.trim().split('\n');
               if (lines.length > 1) {
-                const parts = lines[1].split(',');
-                // wmic csv format: Node,FreeSpace,Size
-                // But order depends on get arguments? No, csv format includes headers. 
-                // However, the original code had: parts[1] free, parts[2] size. Let's stick to that if it worked, 
-                // but wmic csv output order is usually alphabetical if not specified? 
-                // Actually `get Size,FreeSpace` -> might be FreeSpace,Size or Size,FreeSpace depending on version.
-                // Best to trust the previous logic if it worked, or parse headers. 
-                // Previous logic: parts[1] -> freeSpace, parts[2] -> totalSpace.
-                // Let's keep it safe.
-                freeSpace = parseInt(parts[1], 10);
-                totalSpace = parseInt(parts[2], 10);
+                const parts = lines[lines.length - 1].split(',');
+                if (parts.length >= 3) {
+                  // Standard CSV output: Node,FreeSpace,Size
+                  // parts[1] is FreeSpace, parts[2] is Size
+                  freeSpace = parseInt(parts[1], 10);
+                  totalSpace = parseInt(parts[2], 10);
+                }
               }
             }
             resolve();

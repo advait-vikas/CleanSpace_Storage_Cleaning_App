@@ -87,6 +87,8 @@ interface ElectronAPI {
 
   // Applications
   getInstalledApplications: () => Promise<Application[]>;
+  getAppSizes: (apps: Application[]) => Promise<Array<{ id: string, size: number }>>;
+  uninstallApplication: (app: Application) => Promise<{ success: boolean, cancelled?: boolean, error?: string }>;
 
   // Recommendations
   generateRecommendations: (files: FileItem[], applications: Application[]) => Promise<CleanupRecommendation[]>;

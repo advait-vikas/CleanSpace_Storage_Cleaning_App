@@ -37,13 +37,20 @@ export default function Clean() {
     try {
       const result = await deleteFiles(filePaths);
 
-      if (result.success) {
+      if (result.deleted && result.deleted.length > 0) {
         // Clear selected recommendations after successful deletion
+        // Note: For partial failure, we still clear selection to avoid re-deleting same set,
+        // but user might want to know which failed.
         setSelectedRecs(new Set());
-        // Show success message
-        alert(`Successfully cleaned ${result.deleted.length} file(s), freeing ${formatBytes(result.totalSize)}`);
+
+        const successMsg = `Successfully cleaned ${result.deleted.length} file(s), freeing ${formatBytes(result.totalSize)}.`;
+        const failMsg = result.failed && result.failed.length > 0
+          ? `\n\nNote: ${result.failed.length} file(s) could not be deleted (they may be in use).`
+          : '';
+
+        alert(successMsg + failMsg);
       } else if (result.failed && result.failed.length > 0) {
-        setDeleteError(`Failed to delete ${result.failed.length} file(s). Some files may still be in use.`);
+        setDeleteError(`Failed to delete ${result.failed.length} file(s). These files may be in use by other programs or protected.`);
       }
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : 'An error occurred during cleanup');
@@ -78,11 +85,11 @@ export default function Clean() {
   const getSafetyColor = (level: string) => {
     switch (level) {
       case 'safe':
-        return 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/10';
+        return 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/10 text-green-800 dark:text-green-200';
       case 'caution':
-        return 'border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/10';
+        return 'border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/10 text-orange-800 dark:text-orange-200';
       case 'advanced':
-        return 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/10';
+        return 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/10 text-red-800 dark:text-red-200';
       default:
         return '';
     }
@@ -185,8 +192,8 @@ export default function Clean() {
             <div
               key={rec.id}
               className={`bg-white dark:bg-gray-800 rounded-xl shadow-sm border-2 transition-all ${isSelected
-                  ? 'border-blue-500 dark:border-blue-400'
-                  : 'border-gray-200 dark:border-gray-700'
+                ? 'border-blue-500 dark:border-blue-400'
+                : 'border-gray-200 dark:border-gray-700'
                 }`}
             >
               <div className="p-6">

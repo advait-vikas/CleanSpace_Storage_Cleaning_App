@@ -2,33 +2,17 @@
 const fs = require('fs');
 const path = require('path');
 const { shell } = require('electron');
+const { getDirectorySize, isProtectedPath } = require('./utils/fileSystem.cjs');
 
 /**
  * Protected paths that should never be deleted
  */
-const PROTECTED_PATHS = [
-  'C:\\Windows',
-  'C:\\Program Files',
-  'C:\\Program Files (x86)',
-  'C:\\ProgramData',
-  '/System',
-  '/Library',
-  '/usr',
-  '/bin',
-  '/sbin',
-  '/etc'
-];
+// PROTECTED_PATHS is now in fileSystem.cjs
 
 /**
  * Check if a path is protected
  */
-function isProtectedPath(filePath) {
-  const normalizedPath = path.normalize(filePath);
-
-  return PROTECTED_PATHS.some(protectedPath => {
-    return normalizedPath.startsWith(path.normalize(protectedPath));
-  });
-}
+// This function is now imported from fileSystem.cjs
 
 /**
  * Validate file paths before deletion
@@ -89,34 +73,27 @@ function validateFilesForDeletion(filePaths) {
 async function moveToRecycleBin(filePaths) {
   const validation = validateFilesForDeletion(filePaths);
 
-  if (validation.invalid.length > 0) {
+  const deleted = [];
+  const failed = [...validation.invalid];
+  let totalSize = 0;
+
+  // If nothing is valid and we have invalid files, return failure
+  if (validation.valid.length === 0 && failed.length > 0) {
     return {
       success: false,
       deleted: [],
-      failed: validation.invalid,
+      failed: failed,
       totalSize: 0
     };
-  }
-
-  const deleted = [];
-  const failed = [];
-  let totalSize = 0;
-
-  // Calculate total size first
-  for (const filePath of validation.valid) {
-    try {
-      const stats = fs.statSync(filePath);
-      totalSize += stats.size;
-    } catch (error) {
-      // Continue
-    }
   }
 
   // Delete files one by one
   for (const filePath of validation.valid) {
     try {
+      const stats = fs.statSync(filePath);
       await shell.trashItem(filePath);
       deleted.push(filePath);
+      totalSize += stats.size;
     } catch (error) {
       failed.push({
         path: filePath,
@@ -129,7 +106,7 @@ async function moveToRecycleBin(filePaths) {
     success: deleted.length > 0,
     deleted,
     failed,
-    totalSize: deleted.length > 0 ? totalSize : 0 // Rough estimate, usually we care about what was deleted
+    totalSize
   };
 }
 
@@ -140,23 +117,23 @@ async function moveToRecycleBin(filePaths) {
 async function permanentlyDeleteFiles(filePaths) {
   const validation = validateFilesForDeletion(filePaths);
 
-  if (validation.invalid.length > 0) {
+  const deleted = [];
+  const failed = [...validation.invalid];
+  let totalSize = 0;
+
+  // If nothing is valid and we have invalid files, return failure
+  if (validation.valid.length === 0 && failed.length > 0) {
     return {
       success: false,
       deleted: [],
-      failed: validation.invalid,
+      failed: failed,
       totalSize: 0
     };
   }
 
-  const deleted = [];
-  const failed = [];
-  let totalSize = 0;
-
   for (const filePath of validation.valid) {
     try {
       const stats = fs.statSync(filePath);
-      totalSize += stats.size;
 
       if (stats.isDirectory()) {
         fs.rmSync(filePath, { recursive: true, force: true });
@@ -165,6 +142,7 @@ async function permanentlyDeleteFiles(filePaths) {
       }
 
       deleted.push(filePath);
+      totalSize += stats.size;
 
     } catch (error) {
       failed.push({
@@ -218,32 +196,7 @@ function calculateDeletionSize(filePaths) {
 /**
  * Get size of directory recursively
  */
-function getDirectorySize(dirPath) {
-  let totalSize = 0;
-
-  try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-
-      try {
-        if (entry.isDirectory()) {
-          totalSize += getDirectorySize(fullPath);
-        } else {
-          const stats = fs.statSync(fullPath);
-          totalSize += stats.size;
-        }
-      } catch (error) {
-        // Skip inaccessible files/folders
-      }
-    }
-  } catch (error) {
-    // Return size accumulated so far
-  }
-
-  return totalSize;
-}
+// This function is now imported from fileSystem.cjs
 
 /**
  * Restore files from recycle bin (platform-specific)

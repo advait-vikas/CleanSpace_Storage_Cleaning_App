@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 const util = require('util');
+const { getDirectorySize } = require('./utils/fileSystem.cjs');
 
 const execPromise = util.promisify(exec);
 
@@ -40,15 +41,18 @@ async function getWindowsApplications() {
 
     for (const regPath of registryPaths) {
       try {
+        console.log(`Scanning registry: ${regPath}`);
         const { stdout } = await execPromise(
           `reg query "${regPath}" /s`,
           { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
         );
 
         const appData = parseWindowsRegistry(stdout);
+        console.log(`Found ${appData.length} apps in ${regPath}`);
         apps.push(...appData);
       } catch (error) {
         // Some registry paths might not exist or be accessible
+        console.log(`Failed to scan ${regPath}: ${error.message}`);
         continue;
       }
     }
@@ -66,12 +70,29 @@ async function getWindowsApplications() {
       }
     }
 
+
+
+    // Scan Windows Store Apps (Appx)
+    try {
+      const storeApps = await getWindowsStoreApps();
+      apps.push(...storeApps);
+      console.log(`Found ${storeApps.length} Store apps`);
+    } catch (e) {
+      console.error('Error scanning Store apps:', e);
+    }
+
+    console.log(`Total apps found before deduplication: ${apps.length}`);
+
+    // Deduplicate and merge information
+    const uniqueApps = deduplicateApps(apps);
+    console.log(`Unique apps after deduplication: ${uniqueApps.length}`);
+
+    return uniqueApps;
+
   } catch (error) {
     console.error('Error scanning Windows applications:', error);
+    return [];
   }
-
-  // Remove duplicates based on name and path
-  return deduplicateApps(apps);
 }
 
 /**
@@ -84,23 +105,43 @@ function parseWindowsRegistry(output) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+    if (!line) continue;
 
     // New registry key
     if (line.startsWith('HKEY_')) {
-      if (currentApp && currentApp.name) {
+      if (currentApp && currentApp.name && !isSystemComponent(currentApp)) {
+        // Normalize path
+        if (currentApp.path) {
+          currentApp.path = currentApp.path.replace(/"/g, '').trim();
+          if (currentApp.path.endsWith('\\') || currentApp.path.endsWith('/')) {
+            currentApp.path = currentApp.path.slice(0, -1);
+          }
+        }
+
+        if (currentApp.path && fs.existsSync(currentApp.path)) {
+          try {
+            const stats = fs.statSync(currentApp.path);
+            currentApp.lastUsed = stats.atime;
+            currentApp.usage = determineUsage(stats.atime, currentApp.name);
+          } catch (e) { }
+        }
+        currentApp.icon = getAppEmoji(currentApp.name);
+        // console.log(`Found app: ${currentApp.name}`);
         apps.push(currentApp);
       }
       currentApp = {
         id: '',
         name: '',
-        publisher: '',
+        publisher: 'Unknown Publisher',
         size: 0,
         installDate: null,
         lastUsed: null,
         path: '',
-        usage: 'never'
+        usage: 'never',
+        icon: '',
+        uninstallString: ''
       };
-    } else if (currentApp && line.includes('REG_SZ') || line.includes('REG_DWORD')) {
+    } else if (currentApp && (line.includes('REG_SZ') || line.includes('REG_DWORD'))) {
       // Parse registry values
       const parts = line.split(/\s{2,}/);
       if (parts.length >= 3) {
@@ -111,8 +152,20 @@ function parseWindowsRegistry(output) {
           currentApp.name = value;
         } else if (key === 'Publisher') {
           currentApp.publisher = value;
-        } else if (key === 'InstallLocation') {
-          currentApp.path = value;
+        } else if (key === 'InstallLocation' && value) {
+          currentApp.path = value.replace(/"/g, '').trim();
+        } else if (key === 'UninstallString' && value) {
+          currentApp.uninstallString = value;
+          // Try to extract directory from uninstall string if path not already set
+          if (!currentApp.path) {
+            let cleanPath = value.replace(/"/g, '').trim();
+            if (cleanPath.toLowerCase().includes('uninstall')) {
+              currentApp.path = path.dirname(cleanPath);
+            }
+          }
+        } else if (key === 'DisplayIcon' && !currentApp.path && value) {
+          let cleanPath = value.replace(/"/g, '').split(',')[0].trim();
+          currentApp.path = path.dirname(cleanPath);
         } else if (key === 'InstallDate' && value.length === 8) {
           // Format: YYYYMMDD
           const year = value.substring(0, 4);
@@ -120,18 +173,159 @@ function parseWindowsRegistry(output) {
           const day = value.substring(6, 8);
           currentApp.installDate = new Date(`${year}-${month}-${day}`);
         } else if (key === 'EstimatedSize') {
-          // Size in KB
-          currentApp.size = parseInt(value, 10) * 1024;
+          // Size in KB, often in hex like 0x00001900
+          const sizeVal = value.startsWith('0x') ? parseInt(value, 16) : parseInt(value, 10);
+          currentApp.size = (sizeVal || 0) * 1024;
+        } else if (key === 'SystemComponent' && value === '0x1') {
+          currentApp.isSystemComponent = true;
         }
       }
     }
   }
 
-  if (currentApp && currentApp.name) {
+  if (currentApp && currentApp.name && !isSystemComponent(currentApp)) {
+    // Normalize path
+    if (currentApp.path) {
+      currentApp.path = currentApp.path.replace(/"/g, '').trim();
+      if (currentApp.path.endsWith('\\') || currentApp.path.endsWith('/')) {
+        currentApp.path = currentApp.path.slice(0, -1);
+      }
+    }
+
+    // Try to get last used from path if available
+    if (currentApp.path && fs.existsSync(currentApp.path)) {
+      try {
+        const stats = fs.statSync(currentApp.path);
+        currentApp.lastUsed = stats.atime;
+        currentApp.usage = determineUsage(stats.atime, currentApp.name);
+      } catch (e) { }
+    }
+    currentApp.icon = getAppEmoji(currentApp.name);
     apps.push(currentApp);
   }
 
   return apps.filter(app => app.name && app.name.length > 0);
+}
+
+function isSystemComponent(app) {
+  if (app.isSystemComponent) return true;
+  const name = app.name.toLowerCase();
+
+  // Specific exclusions for system background apps and frameworks
+  const exclusions = [
+    'windows driver', 'redistributable',
+    'microsoft.ui.xaml', 'microsoft.vclibs', 'microsoft.net.native',
+    'microsoft.windowsappruntime', 'microsoft.services.store.engagement',
+    'windows.printdialog', 'microsoft.windows.search', 'microsoft.windows.shellexperiencehost',
+    'microsoft.windows.startmenuexperiencehost', 'microsoft.bioenrollment', 'microsoft.aad.brokerplugin',
+    'microsoft.accountscontrol', 'microsoft.asynctextservice', 'microsoft.creddialoghost',
+    'microsoft.ecapp', 'microsoft.lockapp', 'microsoft.win32webviewhost',
+    'microsoft.windows.contentdeliverymanager', 'microsoft.windows.oobenetwork',
+    'microsoft.windows.sechealthui', 'microsoft.windows.cloudexperiencehost',
+    'microsoft.windows.parentalcontrols', 'microsoft.windows.peopleexperiencehost',
+    'microsoft.gethelp', 'microsoft.windows.photos', 'microsoft.xboxgameoverlay',
+    'microsoft.windows.filepicker', 'microsoft.windows.callingfileshellapp',
+    'microsoft.languageexperiencepack', 'microsoft.lexicon', 'microsoft.inputapp',
+    'microsoft.windows.client.cbs', 'microsoft.windows.client.oobe', 'microsoft.windows.client.coreai',
+    'microsoft.windows.client.webexperience', 'microsoft.windows.crossdevice',
+    'microsoft.windows.oobenetworkcaptiveportal', 'microsoft.windows.oobenetworkconnectionflow',
+    'microsoft.windows.shell.omni', 'microsoft.windows.startexperiencesapp',
+    'microsoft.windows.systemtray', 'microsoft.windows.templates', 'microsoft.windows.xwizard',
+    'microsoft.windows.camera', 'microsoft.windows.calculator', 'microsoft.windows.alarms',
+    'microsoft.windows.maps', 'microsoft.windows.soundrecorder', // 'microsoft.windows.store', // Keep Store, useful
+    'microsoft.xbox.tcui', 'microsoft.xboxgamingoverlay', 'microsoft.xboxspeechtowho',
+    'microsoft.yourphone', 'microsoft.zunevideo', 'microsoft.zunemusic',
+    'microsoft.getstarted', 'microsoft.heifimageextension', 'microsoft.vp9videoextensions',
+    'microsoft.webmediaextensions', 'microsoft.webpimageextension', 'microsoft.av1videoextension',
+    'microsoft.rawimageextension', 'microsoft.hevcvideoextensions', 'microsoft.mpeg2videoextension',
+    'appup.intelgraphicsexperience', 'appup.inteloptanememoryandstoragemanagement',
+    'windows.immersivecontrolpanel', 'clipchamp.clipchamp', 'cortana', 'quickassist',
+    'windows.contactsupport', 'windows.print3d', 'xboxgamecallableui', 'xboxidentityprovider',
+    'xboxspeechtowho', 'xbox.tcui', 'yourphone', 'zunevideo', 'zunemusic',
+    'windowsalarms', 'windowscalculator', 'windowscamera', 'windowsmaps', 'windowsphone',
+    'windowssoundrecorder', 'windowsstore', 'xboxapp', 'xboxgameoverlay'
+  ];
+
+  return exclusions.some(ex => name.includes(ex));
+}
+
+function getAppEmoji(name) {
+  const n = name.toLowerCase();
+  if (n.includes('chrome') || n.includes('browser') || n.includes('edge') || n.includes('firefox')) return '🌐';
+  if (n.includes('code') || n.includes('studio') || n.includes('sublime')) return '💻';
+  if (n.includes('game') || n.includes('steam') || n.includes('play')) return '🎮';
+  if (n.includes('music') || n.includes('spotify') || n.includes('itunes')) return '🎵';
+  if (n.includes('video') || n.includes('vlc') || n.includes('player')) return '🎬';
+  if (n.includes('adobe') || n.includes('photo') || n.includes('design')) return '🎨';
+  if (n.includes('office') || n.includes('word') || n.includes('excel')) return '📄';
+  if (n.includes('slack') || n.includes('discord') || n.includes('teams')) return '💬';
+  return '📦';
+}
+
+/**
+ * Scan Windows Store Applications via PowerShell
+ */
+async function getWindowsStoreApps() {
+  const apps = [];
+  try {
+    // Use -NoProfile and -NonInteractive to bypass profile issues
+    const { stdout } = await execPromise(
+      `powershell -NoProfile -NonInteractive -Command "Get-AppxPackage | Select-Object Name, PackageFullName, InstallLocation, Publisher, Version | ConvertTo-Json"`,
+      { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }
+    );
+
+    if (!stdout.trim()) return [];
+
+    let data;
+    try {
+      data = JSON.parse(stdout);
+    } catch (e) {
+      // Sometimes it returns a single object instead of array if only 1 match
+      console.error('Failed to parse Store Apps JSON', e);
+      return [];
+    }
+
+    const list = Array.isArray(data) ? data : [data];
+
+    for (const item of list) {
+      if (!item.Name) continue;
+
+      const installPath = item.InstallLocation;
+      let stats = null;
+      if (installPath && fs.existsSync(installPath)) {
+        try { stats = fs.statSync(installPath); } catch (e) { }
+      }
+
+      // Clean up name
+      let friendlyName = item.Name;
+      // Remove weird prefixes if present
+      if (friendlyName.startsWith('Microsoft.')) friendlyName = friendlyName.replace('Microsoft.', '');
+      if (friendlyName.includes('.')) {
+        // Heuristic: If it looks like com.company.app, try to get last part, but some are just simple names
+        // Most Store apps have reasonably readable names in 'Name' field compared to PackageFullName
+      }
+
+      const app = {
+        id: `store_${item.PackageFullName}`,
+        name: friendlyName,
+        publisher: item.Publisher ? item.Publisher.split(',')[0].replace('CN=', '') : 'Microsoft Store',
+        size: 0, // Will be calculated if path exists
+        installDate: stats ? stats.birthtime : null,
+        lastUsed: stats ? stats.atime : null,
+        path: installPath,
+        usage: stats ? determineUsage(stats.atime, friendlyName) : refineUsage('never', friendlyName),
+        icon: getAppEmoji(friendlyName),
+        isSystemComponent: false // We filter later
+      };
+
+      if (!isSystemComponent(app)) {
+        apps.push(app);
+      }
+    }
+  } catch (error) {
+    console.error('PowerShell Store App scan failed:', error);
+  }
+  return apps;
 }
 
 /**
@@ -144,26 +338,25 @@ async function scanProgramFilesDirectory(dirPath) {
   const apps = [];
 
   try {
-    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
       if (entry.isDirectory()) {
         const fullPath = path.join(dirPath, entry.name);
 
         try {
-          // calculating directory size recursively is too slow for startup
-          // const size = await getDirectorySize(fullPath); 
-          const size = 0; // Default to 0 for performance
+          const stats = fs.statSync(fullPath);
 
           apps.push({
             id: `folder_${entry.name}`,
             name: entry.name,
             publisher: 'Unknown',
-            size: size,
-            installDate: null,
-            lastUsed: null,
+            size: 0,
+            installDate: stats.birthtime || stats.mtime,
+            lastUsed: stats.atime,
             path: fullPath,
-            usage: 'never'
+            usage: determineUsage(stats.atime, entry.name),
+            icon: getAppEmoji(entry.name)
           });
         } catch (error) {
           // Skip inaccessible directories
@@ -194,18 +387,18 @@ async function getMacApplications() {
     for (const entry of entries) {
       if (entry.name.endsWith('.app')) {
         const fullPath = path.join(appDir, entry.name);
-        const size = await getDirectorySize(fullPath);
         const stats = fs.statSync(fullPath);
 
         apps.push({
           id: `mac_${entry.name}`,
           name: entry.name.replace('.app', ''),
           publisher: 'Unknown',
-          size: size,
+          size: 0,
           installDate: stats.birthtime,
           lastUsed: stats.atime,
           path: fullPath,
-          usage: determineUsage(stats.atime)
+          usage: determineUsage(stats.atime, entry.name),
+          icon: getAppEmoji(entry.name)
         });
       }
     }
@@ -249,7 +442,8 @@ async function getLinuxApplications() {
             installDate: null,
             lastUsed: null,
             path: fullPath,
-            usage: 'never'
+            usage: 'never',
+            icon: getAppEmoji(name)
           });
         }
       }
@@ -264,64 +458,138 @@ async function getLinuxApplications() {
 /**
  * Calculate directory size recursively
  */
-async function getDirectorySize(dirPath) {
-  let totalSize = 0;
-
-  try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-
-      try {
-        if (entry.isDirectory()) {
-          totalSize += await getDirectorySize(fullPath);
-        } else {
-          const stats = fs.statSync(fullPath);
-          totalSize += stats.size;
-        }
-      } catch (error) {
-        // Skip inaccessible files/folders
-      }
-    }
-  } catch (error) {
-    // Return size accumulated so far
-  }
-
-  return totalSize;
-}
+// This function is now imported from fileSystem.cjs
 
 /**
  * Determine usage frequency based on last access time
  */
-function determineUsage(lastAccessDate) {
-  if (!lastAccessDate) return 'never';
+function determineUsage(lastAccessDate, appName) {
+  let usage = 'never';
+  if (lastAccessDate) {
+    const daysSinceAccess = (Date.now() - lastAccessDate.getTime()) / (1000 * 60 * 60 * 24);
 
-  const daysSinceAccess = (Date.now() - lastAccessDate.getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceAccess < 7) usage = 'frequent';
+    else if (daysSinceAccess < 30) usage = 'occasional';
+    else if (daysSinceAccess < 90) usage = 'rare';
+    else usage = 'never';
+  }
 
-  if (daysSinceAccess < 7) return 'frequent';
-  if (daysSinceAccess < 30) return 'occasional';
-  if (daysSinceAccess < 90) return 'rare';
-  return 'never';
+  // Refine usage based on app popularity if filesystem stats are misleading (e.g. atime disabled)
+  if (appName) {
+    return refineUsage(usage, appName);
+  }
+  return usage;
+}
+
+/**
+ * Refines usage status for known popular apps that are likely frequent
+ * forcing them out of "Never" or "Rare" lists if stats are missing.
+ */
+function refineUsage(currentUsage, appName) {
+  if (currentUsage === 'frequent' || currentUsage === 'occasional') return currentUsage;
+
+  const n = appName.toLowerCase();
+
+  const popularApps = [
+    'chrome', 'firefox', 'edge', 'brave', 'opera',
+    'discord', 'slack', 'teams', 'zoom', 'whatsapp', 'telegram',
+    'spotify', 'itunes', 'vlc', 'netflix',
+    'visual studio', 'vscode', 'sublime', 'notepad++',
+    'outlook', 'word', 'excel', 'powerpoint', 'onenote',
+    'steam', 'epic games', 'battle.net'
+  ];
+
+  if (popularApps.some(app => n.includes(app))) {
+    return 'frequent'; // Mark as frequent to avoid "Never/Rare" lists
+  }
+
+  return currentUsage;
 }
 
 /**
  * Remove duplicate applications
  */
 function deduplicateApps(apps) {
-  const seen = new Map();
-  const unique = [];
+  const pathMap = new Map(); // key: name|path
+  const nameMap = new Map(); // key: name
 
   for (const app of apps) {
-    const key = `${app.name.toLowerCase()}_${app.path}`;
-    if (!seen.has(key)) {
-      seen.set(key, true);
-      app.id = app.id || `app_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      unique.push(app);
+    if (!app.name) continue;
+
+    const name = app.name.toLowerCase().trim();
+    // Normalize path for comparison
+    let cleanPath = (app.path || '').replace(/"/g, '').trim();
+    if (cleanPath) {
+      cleanPath = path.normalize(cleanPath).toLowerCase().replace(/\\+$/, '');
+    }
+
+    const pathKey = cleanPath ? `${name}|${cleanPath}` : null;
+    let existing = null;
+
+    if (pathKey && pathMap.has(pathKey)) {
+      existing = pathMap.get(pathKey);
+    } else if (nameMap.has(name)) {
+      const candidate = nameMap.get(name);
+      // Only merge if paths don't conflict
+      if (!candidate.path || !app.path || candidate.path === app.path) {
+        existing = candidate;
+      }
+    }
+
+    if (existing) {
+      // Merge properties - keep the better value
+      if (!existing.publisher || existing.publisher === 'Unknown' || existing.publisher === 'Unknown Publisher') {
+        existing.publisher = app.publisher;
+      }
+
+      if (!existing.size || existing.size === 0) {
+        existing.size = app.size;
+      }
+
+      if (!existing.path && app.path) {
+        existing.path = app.path;
+      }
+
+      if (!existing.installDate) {
+        existing.installDate = app.installDate;
+      }
+
+      if (!existing.lastUsed || (app.lastUsed && app.lastUsed > existing.lastUsed)) {
+        existing.lastUsed = app.lastUsed;
+      }
+
+      if (existing.lastUsed) {
+        existing.usage = determineUsage(existing.lastUsed, existing.name);
+      } else if (existing.usage === 'never' && app.usage !== 'never') {
+        existing.usage = app.usage;
+      }
+
+      // Safety check: if known popular app, ensure it's not marked as never/rare after merge
+      existing.usage = refineUsage(existing.usage, existing.name);
+
+      if (!existing.icon && app.icon) {
+        existing.icon = app.icon;
+      }
+    } else {
+      const newApp = { ...app };
+      if (pathKey) pathMap.set(pathKey, newApp);
+
+      if (nameMap.has(name)) {
+        // Collision but rejected merge -> likely different path version
+        newApp.name = `${newApp.name} (${cleanPath || 'Unknown'})`;
+        nameMap.set(newApp.name.toLowerCase(), newApp);
+      } else {
+        nameMap.set(name, newApp);
+      }
     }
   }
 
-  return unique;
+  return Array.from(nameMap.values()).map(app => {
+    if (!app.id) {
+      app.id = `app_${Math.random().toString(36).substr(2, 9)}`;
+    }
+    return app;
+  });
 }
 
 module.exports = {

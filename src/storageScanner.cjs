@@ -2,6 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { getDirectorySize } = require('./utils/fileSystem.cjs');
 
 const EXCLUDE_DIRS = [
   'node_modules', 'Windows', 'Program Files', 'Program Files (x86)',
@@ -20,7 +21,8 @@ const CATEGORIES = {
 };
 
 function shouldExclude(dir) {
-  return EXCLUDE_DIRS.some(ex => dir.includes(ex));
+  const parts = dir.split(path.sep);
+  return EXCLUDE_DIRS.some(ex => parts.includes(ex));
 }
 
 function getCategory(ext) {
@@ -58,12 +60,19 @@ function scanDirectoryAggregated(dir, options = {}) {
   const threeMonthsAgo = new Date();
   threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
 
-  // Definitions for detection
-  const tempExtensions = ['.tmp', '.temp', '.bak', '.old', '.log', '.chk'];
-  const tempDirs = ['temp', 'tmp', 'temporary'];
-  const cachePatterns = ['cache', '.cache'];
-  // We need to know where the Downloads folder is roughly, or check path string
-  // checking path string for "Downloads" is a heuristic
+  // Expanded definitions for detection
+  const tempExtensions = [
+    '.tmp', '.temp', '.bak', '.old', '.log', '.chk', '.dmp',
+    '.thumbs.db', '.thumb', '.ds_store', '.stackdump'
+  ];
+  const tempDirs = [
+    'temp', 'tmp', 'temporary', 'cache', 'caches', 'logs',
+    'npm-cache', 'yarn-cache', 'pip-cache'
+  ];
+  const junkPatterns = [
+    'error.log', 'npm-debug.log', 'yarn-error.log',
+    'ghostscript', 'crash-reports'
+  ];
 
   function addItemSorted(list, item, limit) {
     list.push(item);
@@ -71,113 +80,121 @@ function scanDirectoryAggregated(dir, options = {}) {
     if (list.length > limit) list.pop();
   }
 
-  function walk(currentPath) {
-    if (shouldExclude(currentPath)) return;
+  function startScan() {
+    const stack = [dir];
 
-    // Time-based throttling for progress (every 500ms)
-    const now = Date.now();
-    if (progressCallback && (now - lastProgressTime > 500)) {
-      progressCallback({
-        currentPath,
-        filesScanned: fileCount,
-        progress: 0 // Indeterminate progress for DFS
-      });
-      lastProgressTime = now;
-    }
+    while (stack.length > 0 && fileCount < maxFiles) {
+      const currentPath = stack.pop();
+      if (shouldExclude(currentPath)) continue;
 
-    if (fileCount >= maxFiles) return;
+      // Time-based throttling for progress (every 500ms)
+      const now = Date.now();
+      if (progressCallback && (now - lastProgressTime > 500)) {
+        let progress = 0;
+        if (options.totalUsedSpace && options.totalUsedSpace > 0) {
+          progress = Math.min(99, Math.round((totalSize / options.totalUsedSpace) * 100));
+        }
 
-    let entries;
-    try {
-      entries = fs.readdirSync(currentPath, { withFileTypes: true });
-    } catch {
-      return;
-    }
+        progressCallback({
+          currentPath,
+          filesScanned: fileCount,
+          progress
+        });
+        lastProgressTime = now;
+      }
 
-    for (const entry of entries) {
-      if (fileCount >= maxFiles) break;
+      let entries;
+      try {
+        entries = fs.readdirSync(currentPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
 
-      const fullPath = path.join(currentPath, entry.name);
+      for (const entry of entries) {
+        if (fileCount >= maxFiles) break;
 
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else {
-        try {
-          const stats = fs.statSync(fullPath);
-          const size = stats.size;
-          const ext = path.extname(entry.name).toLowerCase();
-          const category = getCategory(ext);
-          const lowerPath = fullPath.toLowerCase();
+        const fullPath = path.join(currentPath, entry.name);
 
-          fileCount++;
-          totalSize += size;
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
+        } else {
+          try {
+            const stats = fs.statSync(fullPath);
+            const size = stats.size;
+            const ext = path.extname(entry.name).toLowerCase();
+            const category = getCategory(ext);
+            const lowerPath = fullPath.toLowerCase();
 
-          // Update Category Stats
-          if (!categoryStats[category]) categoryStats[category] = { size: 0, count: 0 };
-          categoryStats[category].size += size;
-          categoryStats[category].count++;
+            fileCount++;
+            totalSize += size;
 
-          const fileItem = {
-            id: `file_${fileCount}`, // Simple ID
-            name: entry.name,
-            path: fullPath,
-            size: size,
-            type: ext,
-            category: category,
-            lastAccessed: stats.atime,
-            lastModified: stats.mtime
-          };
+            // Update Category Stats
+            if (!categoryStats[category]) categoryStats[category] = { size: 0, count: 0 };
+            categoryStats[category].size += size;
+            categoryStats[category].count++;
 
-          // 1. Check Large Files (>100MB)
-          if (size > 100 * 1024 * 1024) {
-            addItemSorted(largeFiles, fileItem, 100);
-          }
+            const fileItem = {
+              id: `file_${fileCount}`,
+              name: entry.name,
+              path: fullPath,
+              size: size,
+              type: ext,
+              category: category,
+              lastAccessed: stats.atime,
+              lastModified: stats.mtime
+            };
 
-          // 2. Check Old Files (>6 months and >10MB)
-          if (size > 10 * 1024 * 1024 && stats.atime < sixMonthsAgo) {
-            addItemSorted(oldFiles, fileItem, 100);
-          }
+            // 1. Check Large Files (>100MB)
+            if (size > 100 * 1024 * 1024) {
+              addItemSorted(largeFiles, fileItem, 100);
+            }
 
-          // 3. Check Potential Duplicates (>1MB)
-          if (size > 1 * 1024 * 1024) {
-            const key = `${size}`; // Group by size first for speed
-            if (!potentialDuplicates[key]) potentialDuplicates[key] = [];
-            potentialDuplicates[key].push({ path: fullPath, name: entry.name, size, id: fileItem.id });
+            // 2. Check Old Files (>6 months and >10MB)
+            if (size > 10 * 1024 * 1024 && stats.atime < sixMonthsAgo) {
+              addItemSorted(oldFiles, fileItem, 100);
+            }
 
-            // Limit duplicate candidates per size to avoid memory explosion on massive folders of identical size files
-            if (potentialDuplicates[key].length > 20) potentialDuplicates[key].shift();
-          }
+            // 3. Check Potential Duplicates (>1MB)
+            if (size > 1 * 1024 * 1024) {
+              const key = `${size}`;
+              if (!potentialDuplicates[key]) potentialDuplicates[key] = [];
+              potentialDuplicates[key].push({ path: fullPath, name: entry.name, size, id: fileItem.id });
 
-          // 4. Check Temp Files
-          const isTempExt = tempExtensions.includes(ext);
-          const isTempDir = tempDirs.some(d => lowerPath.includes(`${path.sep}${d}${path.sep}`));
-          if (isTempExt || isTempDir) {
-            addItemSorted(tempFiles, fileItem, 100);
-          }
+              if (potentialDuplicates[key].length > 20) potentialDuplicates[key].shift();
+            }
 
-          // 5. Check Cache Files
-          if (cachePatterns.some(p => lowerPath.includes(p))) {
-            addItemSorted(cacheFiles, fileItem, 100);
-          }
+            // 4. Check Temp/Junk Files
+            const isTempExt = tempExtensions.includes(ext);
+            const isTempDir = tempDirs.some(d => lowerPath.includes(`${path.sep}${d}${path.sep}`) || lowerPath.endsWith(`${path.sep}${d}`));
+            const isJunkPattern = junkPatterns.some(p => lowerPath.includes(p));
 
-          // 6. Check Old Downloads (>3 months)
-          if (lowerPath.includes('downloads') && stats.mtime < threeMonthsAgo) {
-            addItemSorted(oldDownloads, fileItem, 100);
-          }
+            if (isTempExt || isTempDir || isJunkPattern) {
+              addItemSorted(tempFiles, fileItem, 200);
+            }
 
-        } catch { }
+            // 5. Check Cache Files
+            if (lowerPath.includes('cache') || lowerPath.includes('.cache')) {
+              addItemSorted(cacheFiles, fileItem, 200);
+            }
+
+            // 6. Check Old Downloads (>3 months)
+            if (lowerPath.includes('downloads') && stats.mtime < threeMonthsAgo) {
+              addItemSorted(oldDownloads, fileItem, 100);
+            }
+
+          } catch { }
+        }
       }
     }
   }
 
-  walk(dir);
+  startScan();
 
   // Process duplicates: Filter groups with < 2 files
   const realDuplicateCandidates = [];
   for (const key in potentialDuplicates) {
     if (potentialDuplicates[key].length > 1) {
-      // Only if names match too? Or just size? 
-      // Combining size+name check here to be safer/smarter
+      // Compatibility with Old Logic: Check name match primarily
       const nameMap = {};
       for (const f of potentialDuplicates[key]) {
         const k = f.name;
@@ -201,10 +218,6 @@ function scanDirectoryAggregated(dir, options = {}) {
       progress: 100
     });
   }
-
-  // Flatten duplicate candidates into FileItems with duplicate props
-  // We re-construct full items only for these candidates if needed, but we essentially have lightweight items
-  // Let's format the return
 
   return {
     stats: {
@@ -237,16 +250,15 @@ function hashFile(filePath) {
 }
 
 // For backward compatibility / specific checks if needed
-// But scanDirectoryAggregated replaces the need for separate findLarge/findOld
 function findLargeFiles(files, threshold) { return files; }
 function findDuplicateFiles(files) { return files; }
 function findOldFiles(files) { return files; }
 
 module.exports = {
-  scanDirectory: scanDirectoryAggregated, // Main export uses new logic
+  scanDirectory: scanDirectoryAggregated,
   hashFile,
-  findLargeFiles, // Keeping stubs to avoid breaking imports immediately, though main.cjs needs update
+  findLargeFiles,
   findDuplicateFiles,
   findOldFiles,
-  categorizeFiles: (files) => files // No-op, doing it in scan
+  categorizeFiles: (files) => files
 };

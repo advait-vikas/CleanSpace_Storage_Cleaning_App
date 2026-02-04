@@ -18,6 +18,8 @@ interface AppContextType {
   toggleFileSelection: (fileId: string) => void;
   clearSelection: () => void;
   deleteFiles: (filePaths: string[]) => Promise<any>;
+  uninstallApplication: (app: Application) => Promise<boolean>;
+  refreshApplications: () => Promise<void>;
   loading: boolean;
 }
 
@@ -63,6 +65,26 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         try {
           const apps = await window.electronAPI.getInstalledApplications();
           setApplications(apps || []);
+
+          // Trigger background size scan for apps with 0 size but have a path
+          if (apps && apps.length > 0 && window.electronAPI.getAppSizes) {
+            const appsToScan = apps.filter(a => !a.size || a.size === 0 && a.path);
+            if (appsToScan.length > 0) {
+              // Process in small batches of 5 to keep UI responsive and avoid long blocking
+              const batchSize = 5;
+              for (let i = 0; i < appsToScan.length; i += batchSize) {
+                const batch = appsToScan.slice(i, i + batchSize);
+                const updates = await window.electronAPI.getAppSizes(batch);
+
+                if (updates && updates.length > 0) {
+                  setApplications(prev => prev.map(app => {
+                    const update = updates.find(u => u.id === app.id);
+                    return update ? { ...app, size: update.size } : app;
+                  }));
+                }
+              }
+            }
+          }
         } catch (error) {
           console.error('Error loading applications:', error);
           setApplications([]);
@@ -107,7 +129,10 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     });
 
     try {
-      const result = await window.electronAPI.scanDirectoryWithProgress(driveId);
+      const drive = drives.find(d => d.id === driveId);
+      const options = drive ? { totalUsedSpace: drive.usedSpace } : {};
+
+      const result = await window.electronAPI.scanDirectoryWithProgress(driveId, options);
       setCurrentScannerId(result.scannerId);
 
       // 1. Process Categories from Stats
@@ -187,7 +212,30 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       throw new Error('Electron API not available');
     }
 
-    return await window.electronAPI.moveToRecycleBin(filePaths);
+    const result = await window.electronAPI.moveToRecycleBin(filePaths);
+
+    if (result.deleted && result.deleted.length > 0) {
+      const deletedPaths = new Set(result.deleted);
+
+      setLargeFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
+      setDuplicateFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
+      setOldFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
+
+      setRecommendations(prev => prev.map(rec => {
+        const remainingFiles = rec.files.filter(f => !deletedPaths.has(f.path));
+        const remainingSpace = remainingFiles.reduce((sum, f) => sum + f.size, 0);
+        return {
+          ...rec,
+          files: remainingFiles,
+          potentialSpace: remainingSpace
+        };
+      }).filter(rec => rec.files.length > 0));
+
+      // Also clear from selection
+      setSelectedFiles(new Set());
+    }
+
+    return result;
   }, []);
 
   const toggleFileSelection = (fileId: string) => {
@@ -205,6 +253,51 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const clearSelection = () => {
     setSelectedFiles(new Set());
   };
+
+  const uninstallApplication = useCallback(async (app: Application) => {
+    if (!window.electronAPI?.uninstallApplication) return false;
+
+    const result = await window.electronAPI.uninstallApplication(app);
+    if (result.success) {
+      // Refresh applications list
+      const apps = await window.electronAPI.getInstalledApplications();
+      setApplications(apps || []);
+
+      // Update recommendations to remove this app
+      setRecommendations(prev => prev.map(rec => {
+        if (rec.id === 'rec_unused_apps') {
+          const remainingApps = rec.files.filter(f => f.id !== app.id);
+          const remainingSpace = remainingApps.reduce((sum, f) => sum + f.size, 0);
+          return {
+            ...rec,
+            files: remainingApps as any,
+            potentialSpace: remainingSpace
+          };
+        }
+        return rec;
+      }).filter(rec => rec.id !== 'rec_unused_apps' || rec.files.length > 0));
+
+      return true;
+    }
+    return false;
+  }, []);
+
+  const refreshApplications = useCallback(async () => {
+    if (!window.electronAPI?.getInstalledApplications) return;
+    try {
+      setLoading(true);
+      const apps = await window.electronAPI.getInstalledApplications();
+      setApplications(apps || []);
+
+      if (apps && apps.length > 0 && window.electronAPI.getAppSizes) {
+        // Background size scan could be triggered here
+      }
+    } catch (error) {
+      console.error('Error refreshing apps:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   return (
     <AppContext.Provider
@@ -225,6 +318,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         toggleFileSelection,
         clearSelection,
         deleteFiles,
+        uninstallApplication,
+        refreshApplications,
         loading
       }}
     >

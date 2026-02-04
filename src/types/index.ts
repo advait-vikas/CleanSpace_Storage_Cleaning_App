@@ -36,8 +36,11 @@ export interface Application {
   size: number;
   installDate: Date;
   lastUsed: Date | null;
+  path: string;
   icon: string;
   usage: 'never' | 'rare' | 'occasional' | 'frequent';
+  isSystemComponent?: boolean;
+  uninstallString?: string;
 }
 
 export interface CleanupRecommendation {
