@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { AppProvider } from './contexts/AppContext';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
 import Analyze from './pages/Analyze';
@@ -14,17 +15,17 @@ function App() {
   const renderPage = () => {
     switch (currentPage) {
       case 'dashboard':
-        return <Dashboard onNavigate={setCurrentPage} />;
+        return <ErrorBoundary><Dashboard onNavigate={setCurrentPage} /></ErrorBoundary>;
       case 'analyze':
-        return <Analyze />;
+        return <ErrorBoundary><Analyze /></ErrorBoundary>;
       case 'clean':
-        return <Clean />;
+        return <ErrorBoundary><Clean /></ErrorBoundary>;
       case 'applications':
-        return <Applications />;
+        return <ErrorBoundary><Applications /></ErrorBoundary>;
       case 'files':
-        return <Files />;
+        return <ErrorBoundary><Files /></ErrorBoundary>;
       default:
-        return <Dashboard onNavigate={setCurrentPage} />;
+        return <ErrorBoundary><Dashboard onNavigate={setCurrentPage} /></ErrorBoundary>;
     }
   };
 

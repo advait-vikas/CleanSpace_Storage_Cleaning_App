@@ -6,10 +6,10 @@ import {
   Package,
   FolderOpen,
   Moon,
-  Sun,
-  HardDrive
+  Sun
 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
+import appLogo from '../../assets/icon.png';
 
 interface LayoutProps {
   children: ReactNode;
@@ -31,15 +31,13 @@ export default function Layout({ children, currentPage, onPageChange }: LayoutPr
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-900">
       <aside className="w-64 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col">
-        <div className="p-6 border-b border-gray-200 dark:border-gray-700">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg flex items-center justify-center">
-              <HardDrive className="w-6 h-6 text-white" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold text-gray-900 dark:text-white">Storage Manager</h1>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Smart PC Cleaner</p>
-            </div>
+        <div className="p-6 border-b border-gray-200 dark:border-gray-700 flex flex-col items-center text-center">
+          <div className="w-20 h-20 rounded-xl flex items-center justify-center overflow-hidden mb-3 shadow-sm border border-gray-100 dark:border-gray-700 flex-shrink-0">
+            <img src={appLogo} alt="CleanSpace Logo" className="w-full h-full object-cover" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-gray-900 dark:text-white">CleanSpace</h1>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Smart PC Cleaner</p>
           </div>
         </div>
 

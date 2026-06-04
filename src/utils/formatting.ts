@@ -1,5 +1,5 @@
 export const formatBytes = (bytes: number, decimals = 2): string => {
-    if (bytes === 0) return '0 Bytes';
+    if (!bytes || bytes === 0) return '0 Bytes';
 
     const k = 1024;
     const dm = decimals < 0 ? 0 : decimals;
@@ -10,9 +10,14 @@ export const formatBytes = (bytes: number, decimals = 2): string => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
-export const formatDate = (date: Date): string => {
+export const formatDate = (date: Date | string | null | undefined): string => {
+    if (!date) return 'Never';
+
+    const d = date instanceof Date ? date : new Date(date);
+    if (isNaN(d.getTime())) return 'Unknown';
+
     const now = new Date();
-    const diffTime = Math.abs(now.getTime() - date.getTime());
+    const diffTime = Math.abs(now.getTime() - d.getTime());
     const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays === 0) return 'Today';

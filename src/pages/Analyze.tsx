@@ -76,7 +76,7 @@ export default function Analyze() {
               </div>
               <div className="relative h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                 <div
-                  className="absolute inset-y-0 left-0 bg-blue-600 rounded-full transition-all duration-300"
+                  className="absolute inset-y-0 left-0 bg-blue-600 rounded-full"
                   style={{ width: `${scanProgress.progress}%` }}
                 />
               </div>

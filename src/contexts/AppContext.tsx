@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
-import { DriveInfo, FileItem, Application, ScanProgress, CleanupRecommendation, FileCategory } from '../types';
+import { DriveInfo, FileItem, Application, ScanProgress, CleanupRecommendation } from '../types';
 
 interface AppContextType {
   selectedDrive: DriveInfo | null;
@@ -9,7 +9,6 @@ interface AppContextType {
   duplicateFiles: FileItem[];
   oldFiles: FileItem[];
   applications: Application[];
-  categories: FileCategory[];
   recommendations: CleanupRecommendation[];
   scanProgress: ScanProgress;
   startScan: (driveId: string) => void;
@@ -18,12 +17,95 @@ interface AppContextType {
   toggleFileSelection: (fileId: string) => void;
   clearSelection: () => void;
   deleteFiles: (filePaths: string[]) => Promise<any>;
-  uninstallApplication: (app: Application) => Promise<boolean>;
-  refreshApplications: () => Promise<void>;
   loading: boolean;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
+
+// Inline recommendation engine — mirrors recommendationEngine.cjs logic
+// Used as fallback when Electron IPC is unavailable (e.g. browser-only dev mode)
+function generateRecommendationsInline(files: any[], applications: Application[]): CleanupRecommendation[] {
+  const recs: CleanupRecommendation[] = [];
+  const now = Date.now();
+
+  // 1. Large files not accessed in 6+ months
+  const sixMonthsAgo = new Date(now - 6 * 30 * 24 * 60 * 60 * 1000);
+  const largeOld = files.filter(f => f.size >= 100 * 1024 * 1024 && new Date(f.lastAccessed) < sixMonthsAgo);
+  if (largeOld.length > 0) {
+    recs.push({
+      id: 'rec_large_old',
+      title: 'Large Files Not Accessed Recently',
+      description: `${largeOld.length} large files haven't been accessed in over 6 months`,
+      category: 'old',
+      potentialSpace: largeOld.reduce((s, f) => s + f.size, 0),
+      files: largeOld,
+      safetyLevel: 'caution'
+    });
+  }
+
+  // 2. Duplicates (same name + size)
+  const dupGroups: Record<string, any[]> = {};
+  for (const f of files) {
+    const key = `${f.name}_${f.size}`;
+    if (!dupGroups[key]) dupGroups[key] = [];
+    dupGroups[key].push(f);
+  }
+  const dupFiles = Object.values(dupGroups).filter(g => g.length > 1).flatMap(g => g.slice(1));
+  if (dupFiles.length > 0) {
+    recs.push({
+      id: 'rec_duplicates',
+      title: 'Duplicate Files',
+      description: `${dupFiles.length} duplicate files found that can be safely removed`,
+      category: 'duplicates',
+      potentialSpace: dupFiles.reduce((s, f) => s + f.size, 0),
+      files: dupFiles,
+      safetyLevel: 'safe'
+    });
+  }
+
+  // 3. Temp files
+  const tempExts = ['.tmp', '.temp', '.bak', '.old', '.cache'];
+  const tempFiles = files.filter(f => tempExts.includes((f.type || '').toLowerCase()) || f.path?.toLowerCase().includes('\\temp\\'));
+  if (tempFiles.length > 0) {
+    recs.push({
+      id: 'rec_temp',
+      title: 'Temporary Files',
+      description: `${tempFiles.length} temporary files that are safe to remove`,
+      category: 'junk',
+      potentialSpace: tempFiles.reduce((s, f) => s + f.size, 0),
+      files: tempFiles,
+      safetyLevel: 'safe'
+    });
+  }
+
+  // 4. Rarely used apps
+  if (applications?.length > 0) {
+    const unusedApps = applications.filter(a => a.usage === 'never' || a.usage === 'rare');
+    if (unusedApps.length > 0) {
+      recs.push({
+        id: 'rec_unused_apps',
+        title: 'Rarely Used Applications',
+        description: `${unusedApps.length} applications that are rarely or never used`,
+        category: 'apps',
+        potentialSpace: unusedApps.reduce((s, a) => s + a.size, 0),
+        files: unusedApps.map(a => ({
+          id: a.id,
+          name: a.name,
+          path: a.path,
+          size: a.size,
+          type: 'application',
+          category: 'Applications',
+          lastAccessed: a.lastUsed || new Date(0),
+          lastModified: a.installDate || new Date(0),
+          isDuplicate: false
+        })),
+        safetyLevel: 'advanced'
+      });
+    }
+  }
+
+  return recs;
+}
 
 export const AppProvider = ({ children }: { children: ReactNode }) => {
   const [selectedDrive, setSelectedDrive] = useState<DriveInfo | null>(null);
@@ -32,7 +114,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const [duplicateFiles, setDuplicateFiles] = useState<FileItem[]>([]);
   const [oldFiles, setOldFiles] = useState<FileItem[]>([]);
   const [applications, setApplications] = useState<Application[]>([]);
-  const [categories, setCategories] = useState<FileCategory[]>([]);
   const [recommendations, setRecommendations] = useState<CleanupRecommendation[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
@@ -65,26 +146,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         try {
           const apps = await window.electronAPI.getInstalledApplications();
           setApplications(apps || []);
-
-          // Trigger background size scan for apps with 0 size but have a path
-          if (apps && apps.length > 0 && window.electronAPI.getAppSizes) {
-            const appsToScan = apps.filter(a => !a.size || a.size === 0 && a.path);
-            if (appsToScan.length > 0) {
-              // Process in small batches of 5 to keep UI responsive and avoid long blocking
-              const batchSize = 5;
-              for (let i = 0; i < appsToScan.length; i += batchSize) {
-                const batch = appsToScan.slice(i, i + batchSize);
-                const updates = await window.electronAPI.getAppSizes(batch);
-
-                if (updates && updates.length > 0) {
-                  setApplications(prev => prev.map(app => {
-                    const update = updates.find(u => u.id === app.id);
-                    return update ? { ...app, size: update.size } : app;
-                  }));
-                }
-              }
-            }
-          }
         } catch (error) {
           console.error('Error loading applications:', error);
           setApplications([]);
@@ -129,55 +190,35 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     });
 
     try {
-      const drive = drives.find(d => d.id === driveId);
-      const options = drive ? { totalUsedSpace: drive.usedSpace } : {};
+      // Pass applications to options so that the worker can generate recommendations
+      const result = await window.electronAPI.scanDirectoryWithProgress(driveId, { applications });
+      const { scannerId, largeFiles: scannedLarge, oldFiles: scannedOld, duplicateFiles: scannedDups, recommendations: scannedRecs } = result as any;
+      setCurrentScannerId(scannerId);
 
-      const result = await window.electronAPI.scanDirectoryWithProgress(driveId, options);
-      setCurrentScannerId(result.scannerId);
+      // Date helper since IPC serializes Date objects to strings
+      const mapFileDates = (f: any) => ({
+        ...f,
+        lastAccessed: f.lastAccessed ? new Date(f.lastAccessed) : new Date(),
+        lastModified: f.lastModified ? new Date(f.lastModified) : new Date()
+      });
 
-      // 1. Process Categories from Stats
-      if (result.stats && result.stats.categoryStats) {
-        const mappedCategories = result.stats.categoryStats.map((cat: any) => ({
-          ...cat,
-          color: getCategoryColor(cat.name),
-          icon: getCategoryIcon(cat.name)
-        }));
-        setCategories(mappedCategories);
-      }
+      const mappedLarge = (scannedLarge || []).map(mapFileDates);
+      const mappedOld = (scannedOld || []).map(mapFileDates);
+      const mappedDups = (scannedDups || []).map(mapFileDates);
+      const mappedRecs = (scannedRecs || []).map((rec: any) => ({
+        ...rec,
+        files: (rec.files || []).map(mapFileDates)
+      }));
 
-      // 2. Set Large Files
-      setLargeFiles(result.largeFiles || []);
-
-      // 3. Set Duplicates (Flatten the groups)
-      const dups = result.duplicateCandidates || [];
-      const flatDups: any[] = [];
-      if (Array.isArray(dups)) {
-        dups.forEach((group: any[]) => {
-          // Mark duplicates
-          group.forEach((f, idx) => {
-            if (idx > 0) flatDups.push({ ...f, isDuplicate: true, duplicateGroup: group[0].name });
-          });
-        });
-      }
-      setDuplicateFiles(flatDups);
-
-      // 4. Set Old Files
-      setOldFiles(result.oldFiles || []);
-
-      // 5. Generate Recommendations
-      // We pass the aggregated result object since recommendationEngine was updated to handle it
-      try {
-        const recs = await window.electronAPI.generateRecommendations(result as any, applications);
-        setRecommendations(recs);
-      } catch (err) {
-        console.error('Error generating recommendations:', err);
-        setRecommendations([]);
-      }
+      setLargeFiles(mappedLarge);
+      setOldFiles(mappedOld);
+      setDuplicateFiles(mappedDups);
+      setRecommendations(mappedRecs);
 
       setScanProgress({
         isScanning: false,
         currentPath: '',
-        filesScanned: result.stats.fileCount,
+        filesScanned: mappedLarge.length + mappedOld.length + mappedDups.length,
         progress: 100
       });
     } catch (error) {
@@ -214,25 +255,22 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
     const result = await window.electronAPI.moveToRecycleBin(filePaths);
 
-    if (result.deleted && result.deleted.length > 0) {
-      const deletedPaths = new Set(result.deleted);
+    if (result && result.deleted && result.deleted.length > 0) {
+      const deletedPaths = result.deleted;
 
-      setLargeFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
-      setDuplicateFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
-      setOldFiles(prev => prev.filter(f => !deletedPaths.has(f.path)));
+      setLargeFiles(prev => prev.filter(f => !deletedPaths.includes(f.path)));
+      setOldFiles(prev => prev.filter(f => !deletedPaths.includes(f.path)));
+      setDuplicateFiles(prev => prev.filter(f => !deletedPaths.includes(f.path)));
 
       setRecommendations(prev => prev.map(rec => {
-        const remainingFiles = rec.files.filter(f => !deletedPaths.has(f.path));
-        const remainingSpace = remainingFiles.reduce((sum, f) => sum + f.size, 0);
+        const remainingFiles = (rec.files || []).filter(f => !deletedPaths.includes(f.path));
+        const potentialSpace = remainingFiles.reduce((sum, f) => sum + f.size, 0);
         return {
           ...rec,
           files: remainingFiles,
-          potentialSpace: remainingSpace
+          potentialSpace
         };
       }).filter(rec => rec.files.length > 0));
-
-      // Also clear from selection
-      setSelectedFiles(new Set());
     }
 
     return result;
@@ -254,51 +292,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     setSelectedFiles(new Set());
   };
 
-  const uninstallApplication = useCallback(async (app: Application) => {
-    if (!window.electronAPI?.uninstallApplication) return false;
-
-    const result = await window.electronAPI.uninstallApplication(app);
-    if (result.success) {
-      // Refresh applications list
-      const apps = await window.electronAPI.getInstalledApplications();
-      setApplications(apps || []);
-
-      // Update recommendations to remove this app
-      setRecommendations(prev => prev.map(rec => {
-        if (rec.id === 'rec_unused_apps') {
-          const remainingApps = rec.files.filter(f => f.id !== app.id);
-          const remainingSpace = remainingApps.reduce((sum, f) => sum + f.size, 0);
-          return {
-            ...rec,
-            files: remainingApps as any,
-            potentialSpace: remainingSpace
-          };
-        }
-        return rec;
-      }).filter(rec => rec.id !== 'rec_unused_apps' || rec.files.length > 0));
-
-      return true;
-    }
-    return false;
-  }, []);
-
-  const refreshApplications = useCallback(async () => {
-    if (!window.electronAPI?.getInstalledApplications) return;
-    try {
-      setLoading(true);
-      const apps = await window.electronAPI.getInstalledApplications();
-      setApplications(apps || []);
-
-      if (apps && apps.length > 0 && window.electronAPI.getAppSizes) {
-        // Background size scan could be triggered here
-      }
-    } catch (error) {
-      console.error('Error refreshing apps:', error);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
   return (
     <AppContext.Provider
       value={{
@@ -309,7 +302,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         duplicateFiles,
         oldFiles,
         applications,
-        categories,
         recommendations,
         scanProgress,
         startScan,
@@ -318,8 +310,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         toggleFileSelection,
         clearSelection,
         deleteFiles,
-        uninstallApplication,
-        refreshApplications,
         loading
       }}
     >
@@ -333,31 +323,4 @@ export const useApp = () => {
   if (!context) throw new Error('useApp must be used within AppProvider');
   return context;
 };
-
-// Helper functions for category styling
-function getCategoryColor(name: string): string {
-  switch (name.toLowerCase()) {
-    case 'applications': return '#3b82f6';
-    case 'videos': return '#8b5cf6';
-    case 'images': return '#10b981';
-    case 'documents': return '#f59e0b';
-    case 'audio': return '#ec4899';
-    case 'downloads': return '#06b6d4';
-    case 'system & cache': return '#6366f1';
-    default: return '#64748b';
-  }
-}
-
-function getCategoryIcon(name: string): string {
-  switch (name.toLowerCase()) {
-    case 'applications': return 'package';
-    case 'videos': return 'video';
-    case 'images': return 'image';
-    case 'documents': return 'file-text';
-    case 'audio': return 'music';
-    case 'downloads': return 'download';
-    case 'system & cache': return 'hard-drive';
-    default: return 'folder';
-  }
-}
 

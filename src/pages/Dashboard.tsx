@@ -7,7 +7,8 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ onNavigate }: DashboardProps) {
-  const { selectedDrive, drives, setSelectedDrive, categories, recommendations, startScan, scanProgress } = useApp();
+  const { selectedDrive, drives, setSelectedDrive, recommendations, startScan, scanProgress } = useApp();
+  const categories: any[] = [];
 
   if (!selectedDrive || drives.length === 0) {
     return (
@@ -120,7 +121,7 @@ export default function Dashboard({ onNavigate }: DashboardProps) {
                 You can free up {formatBytes(totalRecommendedSpace)} safely
               </h3>
               <p className="text-green-700 dark:text-green-300 mb-4">
-                Smart PC Storage Manager found {recommendations.length} optimization opportunities
+                CleanSpace found {recommendations.length} optimization opportunities
               </p>
               <button
                 onClick={() => onNavigate('clean')}

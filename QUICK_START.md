@@ -1,4 +1,4 @@
-# Quick Start Guide - Storage Manager Dashboard
+# Quick Start Guide - CleanSpace
 
 ## Installation & Setup
 
