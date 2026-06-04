@@ -1,4 +1,4 @@
-# 🚀 Storage Cleaner Assistant
+# 🚀 CleanSpace
 
 [![Electron](https://img.shields.io/badge/Electron-40.0.0-blue.svg)](https://www.electronjs.org/)
 [![React](https://img.shields.io/badge/React-18.3.1-61dafb.svg)](https://reactjs.org/)
